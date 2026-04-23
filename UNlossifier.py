@@ -245,12 +245,6 @@ def multi_stft_loss(pred, target):
 
     return (total_loss / len(fft_sizes)) + 0.2 * stereo_loss
 
-def energy_loss(pred, target):
-    return F.l1_loss(
-        pred.pow(2).mean(dim=-1),
-        target.pow(2).mean(dim=-1)
-    )
-
 # =========================================================
 # DATASET
 # =========================================================
