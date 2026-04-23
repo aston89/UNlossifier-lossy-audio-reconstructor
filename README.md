@@ -86,6 +86,20 @@ The result is a system that does not simply clean audio, but **learns how compre
 
 ---
 
+## 3b. Extended Capability: Sound Signature Simulation
+Beyond restoration, UNlossifier can learn *audio domain transformations* when trained on structured pairs.
+When the dataset is inverted or reinterpreted (e.g. vinyl-clean vs digital-clean, analog chain emulation, codec style mapping), the model shifts from reconstruction to **audio style transfer**.
+
+This enables:
+- Vinyl / tape coloration simulation  
+- Console / mixer signature emulation  
+- Lo-fi / vintage texture generation  
+- Codec-style transformation modeling  
+
+In this mode, UNlossifier behaves less like a repair tool and more like a **learned audio transformation engine**, capturing statistical characteristics of a target sound domain.
+
+---
+
 ## 4. Audio Restoration Philosophy
 UNlossifier is not a traditional restoration tool.  
 It is based on a simple but important premise:
