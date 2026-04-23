@@ -176,7 +176,7 @@ def match_size(x, ref):
 # =========================================================
 def multi_stft_loss(pred, target):
 
-    fft_sizes = [128, 1024, 2048]  # 4096 lo togliamo qui
+    fft_sizes = [128, 1024, 2048]
     total_loss = 0.0
 
     # LR DOMAIN (space)
