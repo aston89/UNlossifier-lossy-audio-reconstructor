@@ -441,7 +441,7 @@ def main():
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--sr", type=int, required=True)
     p.add_argument("--codec", default="mp3", choices=["mp3", "aac", "opus", "vorbis", "wav"])
-    p.add_argument("--bitrate", default="96k", choices=["64k", "96k", "128k", "160k", "192k", "256k", "320k"])
+    p.add_argument("--bitrate", default=None, choices=["64k", "96k", "128k", "160k", "192k", "256k", "320k"])
 
     args = p.parse_args()
 
