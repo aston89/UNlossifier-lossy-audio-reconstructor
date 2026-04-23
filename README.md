@@ -26,6 +26,9 @@ The project is designed to be:
 - **Lossy Artifact Removal**  
   Reduces typical compression artifacts such as pre-echo, high-frequency loss and temporal smearing.
 
+- **Sound Signature Simulator**
+  Coherently imitate a specific style, sound, instrumentation or effect.
+
 - **Spectral Reconstruction**  
   Rebuilds plausible high-frequency content removed by lossy codecs.
 
