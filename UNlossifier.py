@@ -342,7 +342,7 @@ def train(args):
                 l_lr +
                 l_ms +
                 l_stft +
-                0.10 * ms_consistency
+                ms_consistency
             )
 
             opt.zero_grad()
