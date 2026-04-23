@@ -341,31 +341,14 @@ def train(args):
             )
 
             # spectral coherency (all channels)
-            l_spec = multi_stft_loss(pred, clean)
-
-            # energy each domain
-            l_energy_lr = energy_loss(torch.stack([L_p, R_p], dim=1),
-                                      torch.stack([L_t, R_t], dim=1))
-
-            # MS energy (more stable)
-            l_energy_ms = energy_loss(torch.stack([M_p, S_p], dim=1),
-                                      torch.stack([M_t, S_t], dim=1))
-
-			# CROSS DOMAIN CONSISTENCY
-            ms_to_lr = F.l1_loss(
-			    torch.stack([M_p + S_p, M_p - S_p], dim=1),
-			    torch.stack([L_t, R_t], dim=1)
-			)
-
+            l_stft = multi_stft_loss(pred, clean)
 
             # FINAL LOSS
             loss = (
                 l_lr +
                 l_ms +
-                l_spec +
-                0.60 * l_energy_lr + 0.30 * l_energy_ms +
-                0.20 * ms_consistency +
-                0.10 * ms_to_lr
+                l_stft +
+                0.10 * ms_consistency
             )
 
             opt.zero_grad()
@@ -375,7 +358,7 @@ def train(args):
         ckpt = f"model_{args.codec}_{args.bitrate}_{sr}_epoch{epoch:03d}.safetensors"
         sf_torch.save_model(model, os.path.join(CHECKPOINT_DIR, ckpt))
 
-        print(f"""Epoch {epoch} l_lr: {l_lr.item():.6f} l_ms: {l_ms.item():.6f} l_spec: {l_spec.item():.6f} l_energy_lr: {l_energy_lr.item():.6f} l_energy_ms: {l_energy_ms.item():.6f} ms_consistency: {ms_consistency.item():.6f} ms_to_lr: {ms_to_lr.item():.6f} TOTAL: {loss.item():.6f}""")
+        print(f"""Epoch {epoch} l_lr: {l_lr.item():.6f} l_ms: {l_ms.item():.6f} l_stft: {l_stft.item():.6f} ms_consistency: {ms_consistency.item():.6f} TOTAL: {loss.item():.6f}""")
 
 # =========================================================
 # INFERENCE
