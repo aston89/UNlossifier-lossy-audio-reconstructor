@@ -145,7 +145,6 @@ class StereoUNet(nn.Module):
 
         return self.out(x)
 
-
 # =========================================================
 # LOSS
 # =========================================================
@@ -160,15 +159,33 @@ def stft_lr_loss(pred_lr, target_lr):
         loss_scale = 0.0
 
         for ch in [0, 1]:
-            p = torch.stft(pred_lr[:, ch, :], n_fft, hop, window=window, return_complex=True)
-            t = torch.stft(target_lr[:, ch, :], n_fft, hop, window=window, return_complex=True)
+            p = torch.stft(
+                pred_lr[:, ch, :],
+                n_fft,
+                hop,
+                window=window,
+                return_complex=True
+            )
+            t = torch.stft(
+                target_lr[:, ch, :],
+                n_fft,
+                hop,
+                window=window,
+                return_complex=True
+            )
 
             mag_p = torch.abs(p)
             mag_t = torch.abs(t)
 
+            mag_p = mag_p / (mag_p.mean(dim=(-2, -1), keepdim=True) + 1e-6)
+            mag_t = mag_t / (mag_t.mean(dim=(-2, -1), keepdim=True) + 1e-6)
+
+            log_p = torch.log(mag_p + 1e-6)
+            log_t = torch.log(mag_t + 1e-6)
+
             loss_scale += (
                 F.l1_loss(mag_p, mag_t) +
-                F.l1_loss(torch.log(mag_p + 1e-7), torch.log(mag_t + 1e-7))
+                F.l1_loss(log_p, log_t)
             )
 
         losses.append(loss_scale / 2)
@@ -185,8 +202,46 @@ class AudioDataset(torch.utils.data.Dataset):
         self.seg_len = seg_len
         self.sr = sr
 
+        self.flux_cache = {}
+
     def __len__(self):
         return len(self.pairs) * 10
+
+    def compute_flux(self, audio):
+        x = audio[0]
+
+        # STFT
+        S = librosa.stft(x, n_fft=512, hop_length=256)
+        mag = np.abs(S)
+
+        # spectral flux
+        diff = np.diff(mag, axis=1)
+        flux = np.mean(np.maximum(diff, 0.0), axis=0)
+
+        # stereo awareness boost
+        S_stereo = 0.5 * (audio[0] - audio[1])
+        stereo_energy = np.mean(np.abs(S_stereo))
+
+        flux = flux * (1 + 0.3 * stereo_energy)
+
+        # normalize
+        flux = flux + 1e-6
+        flux = flux / flux.sum()
+
+        return flux
+
+    def sample_start(self, flux, total_len):
+        frames = len(flux)
+        probs = flux / flux.sum()
+
+        idx = np.random.choice(np.arange(frames), p=probs)
+
+        hop_audio = 256
+
+        start = idx * hop_audio
+        start = min(start, total_len - self.seg_len)
+
+        return int(start)
 
     def __getitem__(self, idx):
         clean, noisy = self.pairs[random.randint(0, len(self.pairs) - 1)]
@@ -199,7 +254,14 @@ class AudioDataset(torch.utils.data.Dataset):
         if L <= self.seg_len:
             start = 0
         else:
-            start = random.randint(0, L - self.seg_len)
+            key = str(clean)
+
+            if key not in self.flux_cache:
+                self.flux_cache[key] = self.compute_flux(c)
+
+            flux = self.flux_cache[key]
+
+            start = self.sample_start(flux, L)
 
         c = c[:, start:start + self.seg_len]
         n = n[:, start:start + self.seg_len]
@@ -208,7 +270,6 @@ class AudioDataset(torch.utils.data.Dataset):
         n = to_ms(n)
 
         return n, c
-
 
 # =========================================================
 # TRAIN
@@ -237,12 +298,20 @@ def train(args):
         pairs.append((wav, comp_path))
 
     dataset = AudioDataset(pairs, seg_len, sr)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch, shuffle=True, num_workers=2, pin_memory=True, persistent_workers=True)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
 
     model = StereoUNet().to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     for epoch in range(args.epochs):
+        opt.zero_grad()
 
         for noisy, clean in loader:
 
@@ -255,38 +324,52 @@ def train(args):
             pred = pred[..., :min_len]
             clean = clean[..., :min_len]
 
-            L_p, R_p, M_p, S_p = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
-            L_t, R_t, M_t, S_t = clean[:, 0], clean[:, 1], clean[:, 2], clean[:, 3]
+            L_p, R_p = pred[:, 0], pred[:, 1]
+            L_t, R_t = clean[:, 0], clean[:, 1]
 
+            # LR 
             l_lr = F.l1_loss(
                 torch.stack([L_p, R_p], dim=1),
                 torch.stack([L_t, R_t], dim=1)
             )
+
+            # MS
+            M_p = 0.5 * (L_p + R_p)
+            S_p = 0.5 * (L_p - R_p)
+
+            # MS target
+            M_t = 0.5 * (L_t + R_t)
+            S_t = 0.5 * (L_t - R_t)
 
             l_ms = F.l1_loss(
                 torch.stack([M_p, S_p], dim=1),
                 torch.stack([M_t, S_t], dim=1)
             )
 
+            # loss main 
+            l_lmrs = 0.5 * l_lr + 0.5 * l_ms
+
+            # STFT (nuance)
             l_stft = stft_lr_loss(
-                torch.stack([pred[:, 0], pred[:, 1]], dim=1),
-                torch.stack([clean[:, 0], clean[:, 1]], dim=1)
+                torch.stack([L_p, R_p], dim=1),
+                torch.stack([L_t, R_t], dim=1)
             )
 
-            loss = l_lr + l_ms + l_stft
+            # LOSS FINAL
+            loss = l_lmrs + 0.20 * l_stft
 
-            opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            opt.zero_grad()
 
         ckpt = f"model_{args.codec}_{args.bitrate}_{sr}_epoch{epoch:03d}.safetensors"
         sf_torch.save_model(model, os.path.join(CHECKPOINT_DIR, ckpt))
 
-        print(f"Epoch {epoch} l_lr: {l_lr.item():.6f} l_ms: {l_ms.item():.6f} l_stft: {l_stft.item():.6f}")
-
+        print(f"Epoch {epoch} l_lmrs: {l_lmrs.item():.6f} l_stft: {l_stft.item():.6f} TOTAL: {(l_lmrs + 0.20 * l_stft).item():.6f}")
 
 # =========================================================
-# INFERENCE (FIXED PIPELINE)
+# INFERENCE
 # =========================================================
 def inference(args):
 
