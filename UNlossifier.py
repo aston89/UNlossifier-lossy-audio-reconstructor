@@ -61,12 +61,12 @@ def to_ms(x):
     R = x[1]
     M = 0.5 * (L + R)
     S = 0.5 * (L - R)
-    return np.stack([L, R, M, S], axis=0)
+    return torch.stack([L, R, M, S], dim=0)
 
 def from_ms(x):
     L = x[2] + x[3]
     R = x[2] - x[3]
-    return np.stack([L, R], axis=0)
+    return torch.stack([L, R], dim=0)
 
 # =========================================================
 # FFmpeg
@@ -117,50 +117,30 @@ class ConvBlock(nn.Module):
         return self.net(x)
 
 class StereoUNet(nn.Module):
-    def __init__(self, base=64):
+    def __init__(self, base=128):
         super().__init__()
 
         self.enc1 = ConvBlock(4, base)
+        self.enc2 = ConvBlock(base, base)
 
-        self.down1 = nn.Conv1d(base, base, 4, stride=2, padding=1)
+        self.mid = ConvBlock(base, base)
 
-        self.enc2 = ConvBlock(base, base * 2)
-        self.down2 = nn.Conv1d(base * 2, base * 2, 4, stride=2, padding=1)
-
-        self.enc3 = ConvBlock(base * 2, base * 4)
-        self.down3 = nn.Conv1d(base * 4, base * 4, 4, stride=2, padding=1)
-
-        self.mid = ConvBlock(base * 4, base * 4)
-
-        self.up3 = nn.ConvTranspose1d(base * 4, base * 2, 4, stride=2, padding=1)
-        self.dec3 = ConvBlock(base * 4, base * 2)
-
-        self.up2 = nn.ConvTranspose1d(base * 2, base, 4, stride=2, padding=1)
         self.dec2 = ConvBlock(base * 2, base)
+        self.dec1 = ConvBlock(base * 2, base)
 
         self.out = nn.Conv1d(base, 4, 7, padding=3)
 
     def forward(self, x):
         e1 = self.enc1(x)
-        x = self.down1(e1)
+        e2 = self.enc2(e1)
 
-        e2 = self.enc2(x)
-        x = self.down2(e2)
+        x = self.mid(e2)
 
-        e3 = self.enc3(x)
-        x = self.down3(e3)
-
-        x = self.mid(x)
-
-        x = self.up3(x)
-        x = match_size(x, e2)
         x = torch.cat([x, e2], dim=1)
-        x = self.dec3(x)
-
-        x = self.up2(x)
-        x = match_size(x, e1)
-        x = torch.cat([x, e1], dim=1)
         x = self.dec2(x)
+
+        x = torch.cat([x, e1], dim=1)
+        x = self.dec1(x)
 
         return self.out(x)
 
@@ -174,27 +154,20 @@ def match_size(x, ref):
 # =========================================================
 # LOSS
 # =========================================================
-def multi_stft_loss(pred, target):
+def stft_lr_loss(pred_lr, target_lr):
 
     fft_sizes = [128, 1024, 2048]
     losses = []
 
-    px_L = pred[:, 0, :]
-    px_R = pred[:, 1, :]
-    tx_L = target[:, 0, :]
-    tx_R = target[:, 1, :]
-
     for n_fft in fft_sizes:
-
         hop = n_fft // 4
-        window = torch.hann_window(n_fft, device=pred.device)
+        window = torch.hann_window(n_fft, device=pred_lr.device)
 
         loss_scale = 0.0
 
-        for px, tx in [(px_L, tx_L), (px_R, tx_R)]:
-
-            p = torch.stft(px, n_fft, hop, window=window, return_complex=True)
-            t = torch.stft(tx, n_fft, hop, window=window, return_complex=True)
+        for ch in [0, 1]:  # L e R
+            p = torch.stft(pred_lr[:, ch, :], n_fft, hop, window=window, return_complex=True)
+            t = torch.stft(target_lr[:, ch, :], n_fft, hop, window=window, return_complex=True)
 
             mag_p = torch.abs(p)
             mag_t = torch.abs(t)
@@ -206,7 +179,11 @@ def multi_stft_loss(pred, target):
 
         losses.append(loss_scale / 2)
 
-    return losses  # [stft_128, stft_1024, stft_2048]
+    return (
+        0.3 * losses[0] +
+        0.5 * losses[1] +
+        0.2 * losses[2]
+    )
 
 # =========================================================
 # DATASET
@@ -222,15 +199,30 @@ class AudioDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
 
-        clean, noisy = self.pairs[random.randint(0, len(self.pairs)-1)]
+        clean, noisy = self.pairs[random.randint(0, len(self.pairs) - 1)]
 
         c, n = preload_audio_pair(clean, noisy, self.sr)
 
-        L = min(c.shape[1], n.shape[1])
-        start = random.randint(0, max(1, L - self.seg_len))
+        # force tensor istantly (avoid numpy leakage)
+        if isinstance(c, np.ndarray):
+            c = torch.from_numpy(c)
+        if isinstance(n, np.ndarray):
+            n = torch.from_numpy(n)
 
-        c = to_ms(c[:, start:start+self.seg_len])
-        n = to_ms(n[:, start:start+self.seg_len])
+        # security shape (assume [channels, time])
+        L = min(c.shape[1], n.shape[1])
+
+        if L <= self.seg_len:
+            start = 0
+        else:
+            start = random.randint(0, L - self.seg_len)
+
+        c = c[:, start:start + self.seg_len]
+        n = n[:, start:start + self.seg_len]
+
+        # MS encoding with torch
+        c = to_ms(c)
+        n = to_ms(n)
 
         return n, c
 
@@ -276,42 +268,25 @@ def train(args):
             pred = pred[..., :min_len]
             clean = clean[..., :min_len]
 
-            # MS SPLIT LOSS (foundamental)
             L_p, R_p, M_p, S_p = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
             L_t, R_t, M_t, S_t = clean[:, 0], clean[:, 1], clean[:, 2], clean[:, 3]
 
-            # waveform each domain
             l_lr = F.l1_loss(torch.stack([L_p, R_p], dim=1),
                              torch.stack([L_t, R_t], dim=1))
 
             l_ms = F.l1_loss(torch.stack([M_p, S_p], dim=1),
                              torch.stack([M_t, S_t], dim=1))
 
-            # ms consistency
-            M_p, S_p = pred[:, 2], pred[:, 3]
-            L_from_ms = M_p + S_p
-            R_from_ms = M_p - S_p
-
-            ms_consistency = (
-                F.l1_loss(L_from_ms, pred[:, 0]) +
-                F.l1_loss(R_from_ms, pred[:, 1])
-            )
-
-            # spectral coherency (all channels)
-            stft_128, stft_1024, stft_2048 = multi_stft_loss(pred, clean)
-
-            l_stft = (
-                0.3 * stft_128 +
-                0.5 * stft_1024 +
-                0.2 * stft_2048
+            l_stft = stft_lr_loss(
+                torch.stack([pred[:, 0], pred[:, 1]], dim=1),
+                torch.stack([clean[:, 0], clean[:, 1]], dim=1)
             )
 
             # FINAL LOSS
             loss = (
                 l_lr +
                 l_ms +
-                l_stft +
-                0.10 * ms_consistency
+                l_stft
             )
 
             opt.zero_grad()
@@ -321,7 +296,7 @@ def train(args):
         ckpt = f"model_{args.codec}_{args.bitrate}_{sr}_epoch{epoch:03d}.safetensors"
         sf_torch.save_model(model, os.path.join(CHECKPOINT_DIR, ckpt))
 
-        print(f"""Epoch {epoch} l_lr: {l_lr.item():.6f} l_ms: {l_ms.item():.6f} stft_128: {stft_128.item():.6f} stft_1024: {stft_1024.item():.6f} stft_2048: {stft_2048.item():.6f} ms_consistency: {ms_consistency.item():.6f} TOTAL: {loss.item():.6f}""")
+        print(f"""Epoch {epoch} l_lr: {l_lr.item():.6f} l_ms: {l_ms.item():.6f} l_stft: {l_stft.item():.6f} TOTAL: {loss.item():.6f}""")
 
 # =========================================================
 # INFERENCE
@@ -384,7 +359,7 @@ def main():
     p.add_argument("--output", default="restored.wav")
     p.add_argument("--model", default=None)
     p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--batch", type=int, default=2)
+    p.add_argument("--batch", type=int, default=1)
     p.add_argument("--sr", type=int, required=True)
     p.add_argument("--codec", default="mp3", choices=["mp3", "aac", "opus", "vorbis", "wav"])
     p.add_argument("--bitrate", default=None, choices=["64k", "96k", "128k", "160k", "192k", "256k", "320k"])
