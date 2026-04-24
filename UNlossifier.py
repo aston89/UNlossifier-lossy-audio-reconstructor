@@ -9,7 +9,6 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 import safetensors.torch as sf_torch
 
 # =========================================================
@@ -18,6 +17,7 @@ import safetensors.torch as sf_torch
 TEMP_DIR = "./temp_audio"
 CHECKPOINT_DIR = "./"
 os.makedirs(TEMP_DIR, exist_ok=True)
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEG_LEN_SEC = 4
 AUDIO_CACHE = {}
@@ -31,53 +31,43 @@ def load_audio(path, target_sr):
     if audio.ndim == 1:
         audio = np.stack([audio, audio])
 
-    return audio, sr
+    return audio.astype(np.float32), sr
+
 
 def save_audio(path, audio, sr):
     audio = audio.T if audio.shape[0] == 2 else audio
     sf.write(path, audio, sr)
 
-def preload_audio_pair(clean_path, noisy_path, sr):
-    key = (str(clean_path), str(noisy_path))
-
-    if key in AUDIO_CACHE:
-        return AUDIO_CACHE[key]
-
-    c, _ = load_audio(clean_path, sr)
-    n, _ = load_audio(noisy_path, sr)
-
-    c = torch.from_numpy(c).float()
-    n = torch.from_numpy(n).float()
-
-    AUDIO_CACHE[key] = (c, n)
-
-    return c, n
 
 # =========================================================
-# M/S ENCODING
+# MS (NUMPY-FIRST, STABLE)
 # =========================================================
 def to_ms(x):
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+
     L = x[0]
     R = x[1]
     M = 0.5 * (L + R)
     S = 0.5 * (L - R)
-    return torch.stack([L, R, M, S], dim=0)
+
+    return np.stack([L, R, M, S], axis=0).astype(np.float32)
+
 
 def from_ms(x):
+    # x: numpy [4, T]
     L = x[2] + x[3]
     R = x[2] - x[3]
-    return torch.stack([L, R], dim=0)
+    return np.stack([L, R], axis=0)
+
+
+def to_torch(x, device):
+    return torch.from_numpy(x).float().to(device)
+
 
 # =========================================================
 # FFmpeg
 # =========================================================
-def check_ffmpeg():
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except FileNotFoundError:
-        return False
-
 def get_codec_extension(codec):
     return {
         "mp3": ".mp3",
@@ -85,6 +75,7 @@ def get_codec_extension(codec):
         "opus": ".opus",
         "vorbis": ".ogg"
     }.get(codec, "." + codec)
+
 
 def compress_audio(input_path, output_path, bitrate, sr, codec):
     cmd = [
@@ -98,8 +89,9 @@ def compress_audio(input_path, output_path, bitrate, sr, codec):
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
+
 # =========================================================
-# MODEL (4-channel MS)
+# MODEL
 # =========================================================
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
@@ -115,6 +107,7 @@ class ConvBlock(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
 
 class StereoUNet(nn.Module):
     def __init__(self, base=128):
@@ -144,18 +137,11 @@ class StereoUNet(nn.Module):
 
         return self.out(x)
 
-# =========================================================
-# SIZE FIX
-# =========================================================
-def match_size(x, ref):
-    diff = ref.size(-1) - x.size(-1)
-    return F.pad(x, (0, diff)) if diff > 0 else x[..., :ref.size(-1)]
 
 # =========================================================
-# LOSS
+# LOSS (unchanged logic)
 # =========================================================
 def stft_lr_loss(pred_lr, target_lr):
-
     fft_sizes = [128, 1024, 2048]
     losses = []
 
@@ -165,7 +151,7 @@ def stft_lr_loss(pred_lr, target_lr):
 
         loss_scale = 0.0
 
-        for ch in [0, 1]:  # L e R
+        for ch in [0, 1]:
             p = torch.stft(pred_lr[:, ch, :], n_fft, hop, window=window, return_complex=True)
             t = torch.stft(target_lr[:, ch, :], n_fft, hop, window=window, return_complex=True)
 
@@ -179,11 +165,8 @@ def stft_lr_loss(pred_lr, target_lr):
 
         losses.append(loss_scale / 2)
 
-    return (
-        0.3 * losses[0] +
-        0.5 * losses[1] +
-        0.2 * losses[2]
-    )
+    return 0.3 * losses[0] + 0.5 * losses[1] + 0.2 * losses[2]
+
 
 # =========================================================
 # DATASET
@@ -198,18 +181,10 @@ class AudioDataset(torch.utils.data.Dataset):
         return len(self.pairs) * 10
 
     def __getitem__(self, idx):
-
         clean, noisy = self.pairs[random.randint(0, len(self.pairs) - 1)]
 
-        c, n = preload_audio_pair(clean, noisy, self.sr)
+        c, n = load_audio(clean, self.sr)[0], load_audio(noisy, self.sr)[0]
 
-        # force tensor istantly (avoid numpy leakage)
-        if isinstance(c, np.ndarray):
-            c = torch.from_numpy(c)
-        if isinstance(n, np.ndarray):
-            n = torch.from_numpy(n)
-
-        # security shape (assume [channels, time])
         L = min(c.shape[1], n.shape[1])
 
         if L <= self.seg_len:
@@ -220,11 +195,11 @@ class AudioDataset(torch.utils.data.Dataset):
         c = c[:, start:start + self.seg_len]
         n = n[:, start:start + self.seg_len]
 
-        # MS encoding with torch
         c = to_ms(c)
         n = to_ms(n)
 
         return n, c
+
 
 # =========================================================
 # TRAIN
@@ -253,7 +228,7 @@ def train(args):
     loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch, shuffle=True)
 
     model = StereoUNet().to(DEVICE)
-    opt = optim.Adam(model.parameters(), lr=1e-4)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     for epoch in range(args.epochs):
 
@@ -271,23 +246,22 @@ def train(args):
             L_p, R_p, M_p, S_p = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
             L_t, R_t, M_t, S_t = clean[:, 0], clean[:, 1], clean[:, 2], clean[:, 3]
 
-            l_lr = F.l1_loss(torch.stack([L_p, R_p], dim=1),
-                             torch.stack([L_t, R_t], dim=1))
+            l_lr = F.l1_loss(
+                torch.stack([L_p, R_p], dim=1),
+                torch.stack([L_t, R_t], dim=1)
+            )
 
-            l_ms = F.l1_loss(torch.stack([M_p, S_p], dim=1),
-                             torch.stack([M_t, S_t], dim=1))
+            l_ms = F.l1_loss(
+                torch.stack([M_p, S_p], dim=1),
+                torch.stack([M_t, S_t], dim=1)
+            )
 
             l_stft = stft_lr_loss(
                 torch.stack([pred[:, 0], pred[:, 1]], dim=1),
                 torch.stack([clean[:, 0], clean[:, 1]], dim=1)
             )
 
-            # FINAL LOSS
-            loss = (
-                l_lr +
-                l_ms +
-                l_stft
-            )
+            loss = l_lr + l_ms + l_stft
 
             opt.zero_grad()
             loss.backward()
@@ -296,10 +270,11 @@ def train(args):
         ckpt = f"model_{args.codec}_{args.bitrate}_{sr}_epoch{epoch:03d}.safetensors"
         sf_torch.save_model(model, os.path.join(CHECKPOINT_DIR, ckpt))
 
-        print(f"""Epoch {epoch} l_lr: {l_lr.item():.6f} l_ms: {l_ms.item():.6f} l_stft: {l_stft.item():.6f} TOTAL: {loss.item():.6f}""")
+        print(f"Epoch {epoch} llr: {l_lr.item():.6f} l_ms: {l_ms.item():.6f} l_stft: {l_stft.item():.6f}")
+
 
 # =========================================================
-# INFERENCE
+# INFERENCE (FIXED PIPELINE)
 # =========================================================
 def inference(args):
 
@@ -310,9 +285,6 @@ def inference(args):
     sr = args.sr
     audio, _ = load_audio(args.input, sr)
 
-    if audio.ndim == 1:
-        audio = np.stack([audio, audio])
-
     total = audio.shape[1]
     chunk = SEG_LEN_SEC * sr
     step = chunk - int(chunk * 0.1)
@@ -320,7 +292,7 @@ def inference(args):
     out = np.zeros((4, total), dtype=np.float32)
     w = np.zeros((4, total), dtype=np.float32)
 
-    window = np.hanning(chunk)
+    window = np.hanning(chunk).astype(np.float32)
 
     with torch.no_grad():
         for i in range(0, total, step):
@@ -331,10 +303,10 @@ def inference(args):
                 pad = chunk - x.shape[1]
                 x = np.pad(x, ((0,0),(0,pad)))
 
-            x = torch.tensor(to_ms(x)).float().unsqueeze(0).to(DEVICE)
+            x = to_torch(to_ms(x), DEVICE).unsqueeze(0)
 
             y = model(x).squeeze(0).cpu().numpy()
-            y = y[:, :min(chunk, total-i)]
+            y = y[:, :min(chunk, total - i)]
 
             win = window[:y.shape[1]]
 
@@ -348,11 +320,11 @@ def inference(args):
 
     print("Saved:", args.output)
 
+
 # =========================================================
 # MAIN
 # =========================================================
 def main():
-
     p = argparse.ArgumentParser()
 
     p.add_argument("--input", required=True)
@@ -361,8 +333,8 @@ def main():
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--sr", type=int, required=True)
-    p.add_argument("--codec", default="mp3", choices=["mp3", "aac", "opus", "vorbis", "wav"])
-    p.add_argument("--bitrate", default=None, choices=["64k", "96k", "128k", "160k", "192k", "256k", "320k"])
+    p.add_argument("--codec", default="mp3")
+    p.add_argument("--bitrate", default="96k")
 
     args = p.parse_args()
 
@@ -370,6 +342,7 @@ def main():
         inference(args)
     else:
         train(args)
+
 
 if __name__ == "__main__":
     main()
